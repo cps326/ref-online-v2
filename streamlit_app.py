@@ -23,7 +23,7 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 openai.api_key = api_key
 
-st.set_page_config(layout="wide", page_title="KEI 참고문헌 온라인자료 검증도구")
+st.set_page_config(layout="wide", page_title="KEI 참고문헌 온라인자료 검증도구 v.2")
 
 # =========================
 # 최종 출력 컬럼 순서(요청 반영)
