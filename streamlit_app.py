@@ -10,7 +10,6 @@ import streamlit as st
 import io
 import openai
 import time
-from urllib.parse import urljoin, urlparse
 
 # =========================
 # OpenAI API Key (Cloud 중심)
@@ -23,7 +22,7 @@ if not api_key:
 client = OpenAI(api_key=api_key)
 openai.api_key = api_key
 
-st.set_page_config(layout="wide", page_title="KEI 참고문헌 온라인자료 검증도구 v.2")
+st.set_page_config(layout="wide", page_title="KEI 참고문헌 온라인자료 검증도구")
 
 # =========================
 # 최종 출력 컬럼 순서(요청 반영)
@@ -39,20 +38,20 @@ FINAL_COL_ORDER = [
     "원문",
     "참고문헌_작성양식_체크(규칙기반)",
     "참고문헌_작성양식_체크(GPT기반)",
-    # ✅ 기본은 빈 컬럼 유지(실험 옵션 실행 시에만 채움)
+    # ✅ 기본은 비움(실험옵션으로만 채움)
     "URL_내용일치여부(GPT)",
-    # ✅ 새로 추가: 사람이 빠르게 판단할 메타 정보
-    "페이지_title",
-    "페이지_og_title",
-    "페이지_description",
+    # ✅ URL 검사 상세
     "파일_여부",
     "파일_확장자",
     "URL_상태",
     "URL_메모",
     "URL_상태코드",
+    # ✅ 수동 확인
     "URL_수동검증_결과",
     "수동검증_메모",
 ]
+
+DOC_EXTS = [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv", ".rtf"]
 
 
 def reorder_columns(df: pd.DataFrame, order: list[str]) -> pd.DataFrame:
@@ -70,12 +69,6 @@ def ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-# =========================
-# 파일 확장자 판별
-# =========================
-DOC_EXTS = [".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".csv", ".rtf"]
-
-
 def detect_file_ext(url: str) -> str:
     if not isinstance(url, str):
         return ""
@@ -83,7 +76,6 @@ def detect_file_ext(url: str) -> str:
     for ext in DOC_EXTS:
         if ext in lower:
             return ext
-    # 쿼리스트링에 붙는 케이스(?file=.pdf)까지는 여기서 완벽히 잡기 어려움
     return ""
 
 
@@ -145,50 +137,9 @@ def check_url_status(url: str, timeout: int = 15) -> dict:
 
 
 # =========================
-# 메타 정보 추출: title / og:title / meta description
-# - 실패해도 빈값 반환 (성능/안정 목적)
+# 참고문헌 분리 + 규칙 기반 형식 체크(간단/보수)
 # =========================
-def fetch_page_meta(url: str, timeout: int = 12) -> dict:
-    if not isinstance(url, str) or not url.strip():
-        return {"페이지_title": "", "페이지_og_title": "", "페이지_description": ""}
-
-    url = url.strip()
-    if not (url.startswith("http://") or url.startswith("https://")):
-        return {"페이지_title": "", "페이지_og_title": "", "페이지_description": ""}
-
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    # 파일 URL이면 메타 추출 안 함(불필요 + 느림)
-    if detect_file_ext(url):
-        return {"페이지_title": "", "페이지_og_title": "", "페이지_description": ""}
-
-    try:
-        r = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
-        if not (200 <= r.status_code < 300):
-            return {"페이지_title": "", "페이지_og_title": "", "페이지_description": ""}
-
-        soup = BeautifulSoup(r.text, "html.parser")
-
-        title = (soup.title.string.strip() if soup.title and soup.title.string else "")
-        og = soup.find("meta", property="og:title")
-        og_title = og.get("content", "").strip() if og else ""
-        desc = soup.find("meta", attrs={"name": "description"})
-        description = desc.get("content", "").strip() if desc else ""
-
-        # 너무 길면 화면/엑셀 보기 힘드니 컷
-        return {
-            "페이지_title": title[:200],
-            "페이지_og_title": og_title[:200],
-            "페이지_description": description[:300],
-        }
-    except Exception:
-        return {"페이지_title": "", "페이지_og_title": "", "페이지_description": ""}
-
-
-# =========================
-# 참고문헌 분리 + 규칙 기반 형식 체크(간단)
-# =========================
-def separator(entry):
+def separator(entry: str):
     parts = [""] * 4
     if "http" in entry:
         pattern_http = r",\s+(?=http)"
@@ -199,6 +150,7 @@ def separator(entry):
     doc_info = parts_http[0]
     ref_info = parts_http[1] if len(parts_http) > 1 else ""
 
+    # 저자/기관 + 제목(“ ”) 분리 (원문 구조에 따라 완벽하지 않을 수 있어 보수적으로)
     if "“" in doc_info and "”" in doc_info:
         match = re.match(r"(.+?),\s*?“(.*)”", doc_info)
         if match:
@@ -222,8 +174,8 @@ def separator(entry):
     return parts
 
 
-def check_format(text):
-    # 제목(" ") 또는 “ ” 둘 중 하나라도 있으면 일단 OK로 처리(보수적으로)
+def check_format(text: str) -> bool:
+    # 제목 인용부호 " " 또는 “ ” 중 하나라도 있으면 일단 OK (보수)
     if re.search(r'"[^"]*"', text):
         return True
     if re.search(r'“[^”]*”', text):
@@ -232,9 +184,9 @@ def check_format(text):
 
 
 # =========================
-# GPT 형식 검증 (현재는 유지: 너가 프롬프트 바꿀 예정)
+# GPT 형식 검증(선택 실행)
 # =========================
-def GPTcheck(doc):
+def GPTcheck(doc: str) -> dict:
     query = """
     당신은 각 줄마다 아래 형식에 맞는 문헌 정보가 정확히 입력되었는지 검토합니다.
     1. 출처
@@ -266,13 +218,12 @@ def GPTcheck(doc):
 
 
 # =========================
-# (실험 옵션) GPT URL 내용일치 검사 (선택한 행만)
-# - 기본 기능에서는 호출하지 않음
+# (실험 옵션) 선택 행만 GPT로 URL 내용일치 검사
+# - 기본 실행에서는 호출하지 않음
 # =========================
-MAX_LEN = 20000  # 실험이라 더 줄여서 비용/시간 절감
+MAX_LEN = 20000
 
-def crawling_for_gpt(url):
-    # 실험옵션용: 너무 무거운 iframe/리다이렉트 로직은 배제하고 빠르게 텍스트만
+def crawling_for_gpt(url: str) -> str:
     headers = {"User-Agent": "Mozilla/5.0"}
     if not isinstance(url, str) or not url.startswith(("http://", "https://")):
         return "확인불가"
@@ -321,7 +272,7 @@ def gpt_url_match_single(info: str, url: str) -> str:
 # =========================
 # entries -> DataFrame
 # =========================
-def process_entries(entries):
+def process_entries(entries: list[str]) -> pd.DataFrame:
     articles = []
     for entry in entries:
         rule_note = "" if check_format(entry) else "확인필요"
@@ -340,9 +291,7 @@ def process_entries(entries):
         url_result = check_url_status(URL_보고서기준)
 
         file_ext = detect_file_ext(URL_보고서기준 or "")
-        is_file = "파일" if file_ext else "웹"
-
-        meta = fetch_page_meta(url_result.get("URL_최종URL") or URL_보고서기준)
+        file_kind = "파일" if file_ext else "웹"
 
         articles.append({
             "URL_상태": url_result["URL_상태"],
@@ -350,12 +299,8 @@ def process_entries(entries):
             "URL_상태코드": url_result["URL_상태코드"],
             "URL_수정안": url_result["URL_최종URL"],
 
-            "파일_여부": is_file,
+            "파일_여부": file_kind,
             "파일_확장자": file_ext,
-
-            "페이지_title": meta["페이지_title"],
-            "페이지_og_title": meta["페이지_og_title"],
-            "페이지_description": meta["페이지_description"],
 
             "작성기관_작성자": 작성기관_작성자,
             "제목": 제목,
@@ -365,7 +310,6 @@ def process_entries(entries):
             "원문": entry,
             "참고문헌_작성양식_체크(규칙기반)": rule_note,
 
-            # 기본은 비움(실험옵션으로만 채움)
             "URL_내용일치여부(GPT)": "",
             "참고문헌_작성양식_체크(GPT기반)": "",
         })
@@ -430,10 +374,10 @@ def main():
     if "result_df" not in st.session_state:
         st.session_state["result_df"] = None
 
-    # ✅ 옵션: GPT URL 내용일치 기본 제거 (실험 옵션만 제공)
+    # ✅ 옵션: GPT URL 내용일치 기본 제거(실험 옵션만 제공)
     st.subheader("✅ 실행 옵션(선택)")
     do_gpt_format = st.checkbox("GPT로 참고문헌 작성양식 검토하기(선택)", value=False)
-    st.caption("URL 내용일치(GPT)는 기본에서 제거했습니다. 필요 시 아래 ‘실험 기능’에서 일부 행만 선택 실행할 수 있습니다.")
+    enable_gpt_url_experiment = st.checkbox("🧪 (실험) 선택한 행만 GPT로 URL 내용일치 검사 사용", value=False)
 
     uploaded_file = st.file_uploader(
         "보고서 참고문헌 중 온라인자료에 해당하는 텍스트 파일(txt)를 업로드 하거나 ",
@@ -488,7 +432,7 @@ def main():
         entries = data.strip().splitlines()
 
         progress_bar.progress(20)
-        status_text.text("2단계: 규칙기반 작성양식 + URL 상태/최종URL + 메타 정보 추출 중...")
+        status_text.text("2단계: 규칙기반 작성양식 + URL 상태/최종URL + 파일 여부 확인 중...")
 
         result_df = process_entries(entries)
 
@@ -529,7 +473,6 @@ def main():
         result_df = ensure_required_columns(st.session_state["result_df"])
         result_df = reorder_columns(result_df, FINAL_COL_ORDER)
 
-        # 마커(다음 expander 스타일 적용용)
         st.markdown('<div class="manual-expander-marker"></div>', unsafe_allow_html=True)
 
         with st.expander(
@@ -539,7 +482,6 @@ def main():
             issue_mask = result_df["URL_상태"].isin(["오류", "확인불가"])
             issues_cols = [
                 "URL_상태", "URL_메모", "URL_보고서기준", "URL_수정안",
-                "페이지_title", "페이지_og_title", "페이지_description",
                 "작성기관_작성자", "제목",
                 "URL_수동검증_결과", "수동검증_메모"
             ]
@@ -560,7 +502,7 @@ def main():
                         ),
                         "수동검증_메모": st.column_config.TextColumn("수동검증_메모"),
                     },
-                    disabled=[c for c in ["URL_상태", "URL_메모", "작성기관_작성자", "제목", "페이지_title", "페이지_og_title", "페이지_description"] if c in issues_df.columns],
+                    disabled=[c for c in ["URL_상태", "URL_메모", "작성기관_작성자", "제목"] if c in issues_df.columns],
                     key="manual_editor",
                 )
 
@@ -579,41 +521,42 @@ def main():
                     st.success("수동 판정을 최종 값에 반영했습니다.")
 
         # =========================
-        # ✅ 실험 기능: 선택한 행만 GPT URL 내용일치 검사
+        # 🧪 실험 기능: 선택한 행만 GPT URL 내용일치 검사
         # =========================
-        with st.expander("🧪 (실험) 선택한 행만 GPT로 URL 내용일치 검토하기 (기본 비활성)", expanded=False):
-            st.caption("⚠️ 이 기능은 실험용입니다. 선택한 일부 행만 GPT가 페이지 텍스트를 보고 '일치/불일치'를 판단합니다.")
-            st.caption("비용/시간이 들 수 있으니, 꼭 필요한 항목만 선택해서 실행하세요.")
+        if enable_gpt_url_experiment:
+            with st.expander("🧪 (실험) 선택한 행만 GPT로 URL 내용일치 검토하기", expanded=False):
+                st.caption("⚠️ 이 기능은 실험용입니다. 선택한 일부 행만 GPT가 페이지 텍스트를 보고 '일치/불일치'를 판단합니다.")
+                st.caption("비용/시간이 들 수 있으니, 꼭 필요한 항목만 선택해서 실행하세요.")
 
-            selectable_cols = ["작성기관_작성자", "제목", "URL_보고서기준", "URL_수정안", "페이지_title", "페이지_description", "URL_내용일치여부(GPT)"]
-            view_df = result_df[[c for c in selectable_cols if c in result_df.columns]].copy()
-            view_df.insert(0, "선택", False)
+                selectable_cols = ["작성기관_작성자", "제목", "URL_보고서기준", "URL_수정안", "URL_내용일치여부(GPT)"]
+                view_df = result_df[[c for c in selectable_cols if c in result_df.columns]].copy()
+                view_df.insert(0, "선택", False)
 
-            edited_sel = st.data_editor(
-                view_df,
-                use_container_width=True,
-                column_config={
-                    "URL_보고서기준": st.column_config.LinkColumn("URL(클릭)", display_text="열기"),
-                    "URL_수정안": st.column_config.LinkColumn("최종 URL(클릭)", display_text="열기"),
-                    "선택": st.column_config.CheckboxColumn("선택"),
-                },
-                key="gpt_urlmatch_selector",
-            )
+                edited_sel = st.data_editor(
+                    view_df,
+                    use_container_width=True,
+                    column_config={
+                        "URL_보고서기준": st.column_config.LinkColumn("URL(클릭)", display_text="열기"),
+                        "URL_수정안": st.column_config.LinkColumn("최종 URL(클릭)", display_text="열기"),
+                        "선택": st.column_config.CheckboxColumn("선택"),
+                    },
+                    key="gpt_urlmatch_selector",
+                )
 
-            if st.button("🧪 선택한 행만 GPT URL 내용일치 실행"):
-                selected_idx = edited_sel.index[edited_sel["선택"] == True].tolist()
-                if not selected_idx:
-                    st.warning("선택된 행이 없습니다. 먼저 ‘선택’ 체크박스를 눌러주세요.")
-                else:
-                    prog = st.progress(0)
-                    for k, idx in enumerate(selected_idx):
-                        info = f"{result_df.loc[idx, '제목']} + {result_df.loc[idx, '작성기관_작성자']}"
-                        # 최종 URL이 있으면 그걸 우선 사용
-                        url = result_df.loc[idx, "URL_수정안"] or result_df.loc[idx, "URL_보고서기준"]
-                        result_df.loc[idx, "URL_내용일치여부(GPT)"] = gpt_url_match_single(info, url)
-                        prog.progress(int(100 * (k + 1) / len(selected_idx)))
-                    st.session_state["result_df"] = reorder_columns(result_df, FINAL_COL_ORDER)
-                    st.success("선택한 행에 대해 GPT URL 내용일치 결과를 반영했습니다(실험).")
+                if st.button("🧪 선택한 행만 GPT URL 내용일치 실행"):
+                    selected_idx = edited_sel.index[edited_sel["선택"] == True].tolist()
+                    if not selected_idx:
+                        st.warning("선택된 행이 없습니다. 먼저 ‘선택’ 체크박스를 눌러주세요.")
+                    else:
+                        prog = st.progress(0)
+                        for k, idx in enumerate(selected_idx):
+                            info = f"{result_df.loc[idx, '제목']} + {result_df.loc[idx, '작성기관_작성자']}"
+                            url = result_df.loc[idx, "URL_수정안"] or result_df.loc[idx, "URL_보고서기준"]
+                            result_df.loc[idx, "URL_내용일치여부(GPT)"] = gpt_url_match_single(info, url)
+                            prog.progress(int(100 * (k + 1) / len(selected_idx)))
+
+                        st.session_state["result_df"] = reorder_columns(result_df, FINAL_COL_ORDER)
+                        st.success("선택한 행에 대해 GPT URL 내용일치 결과를 반영했습니다(실험).")
 
         # 메인 표
         styled = result_df.style.applymap(highlight_url_status, subset=["최종_URL_상태"])
